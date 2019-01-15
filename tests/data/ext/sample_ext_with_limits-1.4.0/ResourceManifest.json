@@ -1,0 +1,32 @@
+{
+    "name": "ExampleHandlerLinux",
+    "version": 1.0,
+    "resourceRequirements": {
+        "cpu": [{
+                "size": "small",
+                "limits": 25
+            },
+            {
+                "size": "medium",
+                "limits": 20
+            },
+            {
+                "size": "large",
+                "limits": 15
+            }
+        ],
+        "memory": [{
+                "size": "small",
+                "limits": 20
+            },
+            {
+                "size": "medium",
+                "limits": 20
+            },
+            {
+                "size": "large",
+                "limits": 15
+            }
+        ]
+    }
+}

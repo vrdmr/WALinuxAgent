@@ -49,7 +49,7 @@ class TestExtensionCleanup(AgentTestCase):
 
     def _install_handlers(self, start=0, count=1,
                           handler_state=ExtHandlerState.Installed):
-        src = os.path.join(data_dir, "ext", "sample_ext-1.3.0.zip")
+        src = os.path.join(data_dir, "ext", "sample_ext-1.4.0.zip")
         version = FlexibleVersion("1.3.0")
         version += start - version.patch
 
@@ -406,6 +406,15 @@ class TestExtension(ExtensionTestCase):
 
         exthandlers_handler.run()
         self._assert_handler_status(protocol.report_vm_status, "Ready", 1, "1.0.0")
+
+    def test_ext_handler_with_cgroup_limits_in_manifest(self, *args):
+        test_data = WireProtocolData(DATA_FILE_CGROUP_LIMITS_SET)
+        exthandlers_handler, protocol = self._create_mock(test_data, *args)
+
+        # Test enable scenario.
+        exthandlers_handler.run()
+        self._assert_handler_status(protocol.report_vm_status, "Ready", 1, "1.0.0")
+        self._assert_ext_status(protocol.report_ext_status, "success", 0)
 
     def test_ext_handler_no_ext(self, *args):
         test_data = WireProtocolData(DATA_FILE_NO_EXT)
@@ -1388,6 +1397,60 @@ class TestExtension(ExtensionTestCase):
         exthandlers_handler.run()
         self.assertEqual(1, patch_get_update_command.call_count)
         self.assertEqual(1, patch_handle_handle_ext_handler_error.call_count)
+
+
+#@skip_if_predicate_false(CGroups.enabled, "CGroups not supported in this environment")
+@patch("azurelinuxagent.common.protocol.wire.CryptUtil")
+@patch("azurelinuxagent.common.utils.restutil.http_get")
+class TestExtensionWithCGroupsEnabled(AgentTestCase):
+    def _assert_handler_status(self, report_vm_status, expected_status,
+                               expected_ext_count, version,
+                               expected_handler_name="OSTCExtensions.ExampleHandlerLinux"):
+        self.assertTrue(report_vm_status.called)
+        args, kw = report_vm_status.call_args
+        vm_status = args[0]
+        self.assertNotEquals(0, len(vm_status.vmAgent.extensionHandlers))
+        handler_status = vm_status.vmAgent.extensionHandlers[0]
+        self.assertEquals(expected_status, handler_status.status)
+        self.assertEquals(expected_handler_name,
+                          handler_status.name)
+        self.assertEquals(version, handler_status.version)
+        self.assertEquals(expected_ext_count, len(handler_status.extensions))
+        return
+
+    def _assert_ext_status(self, report_ext_status, expected_status,
+                           expected_seq_no):
+        self.assertTrue(report_ext_status.called)
+        args, kw = report_ext_status.call_args
+        ext_status = args[-1]
+        self.assertEquals(expected_status, ext_status.status)
+        self.assertEquals(expected_seq_no, ext_status.sequenceNumber)
+
+    def _create_mock(self, test_data, mock_http_get, MockCryptUtil):
+        """Test enable/disable/uninstall of an extension"""
+        handler = get_exthandlers_handler()
+
+        # Mock protocol to return test data
+        mock_http_get.side_effect = test_data.mock_http_get
+        MockCryptUtil.side_effect = test_data.mock_crypt_util
+
+        protocol = WireProtocol("foo.bar")
+        protocol.detect()
+        protocol.report_ext_status = MagicMock()
+        protocol.report_vm_status = MagicMock()
+
+        handler.protocol_util.get_protocol = Mock(return_value=protocol)
+        return handler, protocol
+
+    @patch("azurelinuxagent.common.cgroups.CGroups.add")
+    def test_ext_handler_with_cgroup_limits_in_manifest(self, mock_add_pid, *args):
+        test_data = WireProtocolData(DATA_FILE_CGROUP_LIMITS_SET)
+        exthandlers_handler, protocol = self._create_mock(test_data, *args)
+
+        # Test enable scenario.
+        exthandlers_handler.run()
+        self._assert_handler_status(protocol.report_vm_status, "Ready", 1, "1.0.0")
+        self._assert_ext_status(protocol.report_ext_status, "success", 0)
 
 
 @patch("azurelinuxagent.common.protocol.wire.CryptUtil")

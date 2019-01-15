@@ -837,39 +837,86 @@ class ExtHandlerInstance(object):
     def enable(self):
         self.set_operation(WALAEventOperation.Enable)
         man = self.load_manifest()
+        try:
+            resource_man = self.load_resource_manifest()
+        except ExtensionError as e:
+            self.logger.verbose('Failed to load resource manifest file: {0}'.format(e.message))
+
         enable_cmd = man.get_enable_command()
         self.logger.info("Enable extension [{0}]".format(enable_cmd))
-        self.launch_command(enable_cmd, timeout=300, extension_error_code=1009)
+        self.launch_command(enable_cmd, timeout=300, extension_error_code=1009, resource_limits=resource_man)
         self.set_handler_state(ExtHandlerState.Enabled)
         self.set_handler_status(status="Ready", message="Plugin enabled")
 
     def disable(self):
         self.set_operation(WALAEventOperation.Disable)
         man = self.load_manifest()
+        try:
+            resource_man = self.load_resource_manifest()
+        except ExtensionError as e:
+            self.logger.verbose('Failed to load resource manifest file: {0}'.format(e.message))
+
         disable_cmd = man.get_disable_command()
         self.logger.info("Disable extension [{0}]".format(disable_cmd))
         self.launch_command(disable_cmd, timeout=900,
-                            extension_error_code=1010)
+                            extension_error_code=1010,
+                            resource_limits=resource_man)
         self.set_handler_state(ExtHandlerState.Installed)
         self.set_handler_status(status="NotReady", message="Plugin disabled")
 
     def install(self):
         man = self.load_manifest()
+        try:
+            resource_man = self.load_resource_manifest()
+        except ExtensionError as e:
+            self.logger.verbose('Failed to load resource manifest file: {0}'.format(e.message))
+
         install_cmd = man.get_install_command()
         self.logger.info("Install extension [{0}]".format(install_cmd))
         self.set_operation(WALAEventOperation.Install)
-        self.launch_command(install_cmd, timeout=900, extension_error_code=1007)
+        self.launch_command(install_cmd, timeout=900,
+                            extension_error_code=1007,
+                            resource_limits=resource_man)
         self.set_handler_state(ExtHandlerState.Installed)
 
     def uninstall(self):
         try:
             self.set_operation(WALAEventOperation.UnInstall)
             man = self.load_manifest()
+            try:
+                resource_man = self.load_resource_manifest()
+            except ExtensionError as e:
+                self.logger.verbose('Failed to load resource manifest file: {0}'.format(e.message))
+
             uninstall_cmd = man.get_uninstall_command()
             self.logger.info("Uninstall extension [{0}]".format(uninstall_cmd))
-            self.launch_command(uninstall_cmd)
+            self.launch_command(uninstall_cmd, resource_limits=resource_man)
         except ExtensionError as e:
             self.report_event(message=ustr(e), is_success=False)
+
+    def update(self, version=None):
+        if version is None:
+            version = self.ext_handler.properties.version
+
+        try:
+            self.set_operation(WALAEventOperation.Update)
+            man = self.load_manifest()
+            try:
+                resource_man = self.load_resource_manifest()
+            except ExtensionError as e:
+                self.logger.verbose('Failed to load resource manifest file: {0}'.format(e.message))
+
+            update_cmd = man.get_update_command()
+            self.logger.info("Update extension [{0}]".format(update_cmd))
+            self.launch_command(update_cmd,
+                                timeout=900,
+                                extension_error_code=1008,
+                                env={'VERSION': version},
+                                resource_limits=resource_man)
+        except ExtensionError:
+            # prevent the handler update from being retried
+            self.set_handler_state(ExtHandlerState.Failed)
+            raise
 
     def rm_ext_handler_dir(self):
         try:
@@ -888,24 +935,6 @@ class ExtHandlerInstance(object):
             message = "Failed to remove extension handler directory: {0}".format(e)
             self.report_event(message=message, is_success=False)
             self.logger.warn(message)
-
-    def update(self, version=None):
-        if version is None:
-            version = self.ext_handler.properties.version
-
-        try:
-            self.set_operation(WALAEventOperation.Update)
-            man = self.load_manifest()
-            update_cmd = man.get_update_command()
-            self.logger.info("Update extension [{0}]".format(update_cmd))
-            self.launch_command(update_cmd,
-                                timeout=900,
-                                extension_error_code=1008,
-                                env={'VERSION': version})
-        except ExtensionError:
-            # prevent the handler update from being retried
-            self.set_handler_state(ExtHandlerState.Failed)
-            raise
 
     def update_with_install(self):
         man = self.load_manifest()
@@ -1067,7 +1096,7 @@ class ExtHandlerInstance(object):
         last_update = int(time.time() - os.stat(heartbeat_file).st_mtime)
         return last_update <= 600
 
-    def launch_command(self, cmd, timeout=300, extension_error_code=1000, env=None):
+    def launch_command(self, cmd, timeout=300, extension_error_code=1000, env=None, resource_limits=None):
         begin_utc = datetime.datetime.utcnow()
         self.logger.verbose("Launch command: [{0}]", cmd)
 
@@ -1103,7 +1132,7 @@ class ExtHandlerInstance(object):
                     raise ExtensionOperationError("Failed to launch '{0}': {1}".format(full_path, e.strerror),
                                                   code=extension_error_code)
 
-                cg = CGroups.for_extension(self.ext_handler.name)
+                cg = CGroups.for_extension(self.ext_handler.name, resource_limits)
                 CGroupsTelemetry.track_extension(self.ext_handler.name, cg)
                 msg = ExtHandlerInstance._capture_process_output(process, stdout, stderr, cmd, timeout, extension_error_code)
 
@@ -1146,6 +1175,17 @@ class ExtHandlerInstance(object):
             raise ExtensionError("Non-zero exit code: {0}, {1}\n{2}".format(return_code, cmd, read_output()), code=code)
 
         return read_output()
+
+    def load_resource_manifest(self):
+        man_file = self.get_resource_manifest_file()
+        try:
+            data = json.loads(fileutil.read_file(man_file))
+        except (IOError, OSError) as e:
+            raise ExtensionError('Failed to load resource manifest file ({0}): {1}'.format(man_file, e.strerror))
+        except ValueError:
+            raise ExtensionError('Malformed resource manifest file ({0}).'.format(man_file))
+
+        return ResourceManifest(data)
 
     def load_manifest(self):
         man_file = self.get_manifest_file()
@@ -1288,6 +1328,9 @@ class ExtHandlerInstance(object):
     def get_manifest_file(self):
         return os.path.join(self.get_base_dir(), 'HandlerManifest.json')
 
+    def get_resource_manifest_file(self):
+        return os.path.join(self.get_base_dir(), 'ResourceManifest.json')
+
     def get_env_file(self):
         return os.path.join(self.get_base_dir(), 'HandlerEnvironment.json')
 
@@ -1320,6 +1363,7 @@ class HandlerManifest(object):
         if data is None or data['handlerManifest'] is None:
             raise ExtensionError('Malformed manifest file.')
         self.data = data
+        self.contains_resource_limits = 'resourceRequirements' in data
 
     def get_name(self):
         return self.data["name"]
@@ -1350,3 +1394,49 @@ class HandlerManifest(object):
         if update_mode is None:
             return True
         return update_mode.lower() == "updatewithinstall"
+
+    def get_resource_requirements(self):
+        return self.data['resourceRequirements'] if self.contains_resource_limits else None
+
+    def get_memory_resource_requirements(self):
+        return self.data['resourceRequirements']['memory'] if self.contains_resource_limits and \
+                                                              'memory' in self.data['resourceRequirements'] else None
+
+    def get_cpu_resource_requirements(self):
+        return self.data['resourceRequirements']['cpu'] if self.contains_resource_limits and \
+                                                           'cpu' in self.data['resourceRequirements'] else None
+
+
+class ResourceManifest(object):
+    def __init__(self, data):
+        if data is None or data['resourceRequirements'] is None:
+            raise ExtensionError('Malformed resource manifest file.')
+        self.data = data
+
+    def get_name(self):
+        return self.data["name"]
+
+    def get_version(self):
+        return self.data["version"]
+
+    def get_cpu_limits(self):
+        cpu_limits = []
+        if "cpu" in self.data['resourceRequirements']:
+            for i in self.data['resourceRequirements']["cpu"]:
+                cpu_limits.append(ResourceLimits(i))
+
+        return cpu_limits
+
+    def get_memory_limits(self):
+        memory_limits = []
+        if "memory" in self.data['resourceRequirements']:
+            for i in self.data['resourceRequirements']["memory"]:
+                memory_limits.append(ResourceLimits(i))
+
+        return memory_limits
+
+
+class ResourceLimits(object):
+    def __init__(self, data):
+        self.size = data["size"]
+        self.limits = data["limits"]
