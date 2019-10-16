@@ -25,24 +25,24 @@ import os
 import random
 import re
 import shutil
-import stat
 import signal
+import stat
 import subprocess
-import time
+import sys
 import tempfile
+import time
 import traceback
 import zipfile
-import sys
 
 import azurelinuxagent.common.conf as conf
 import azurelinuxagent.common.logger as logger
 import azurelinuxagent.common.utils.fileutil as fileutil
 import azurelinuxagent.common.version as version
-from azurelinuxagent.common.cgroups import CGroups, CGroupsTelemetry
+from azurelinuxagent.common.cgroups.cgroups import CGroups, CGroupsTelemetry
 from azurelinuxagent.common.errorstate import ErrorState, ERROR_STATE_DELTA_INSTALL
-from azurelinuxagent.common.event import add_event, WALAEventOperation, elapsed_milliseconds, report_event
+from azurelinuxagent.common.event import add_event, WALAEventOperation, elapsed_milliseconds
 from azurelinuxagent.common.exception import ExtensionError, ProtocolError, ProtocolNotFoundError, \
-    ExtensionDownloadError, ExtensionOperationError
+    ExtensionDownloadError, ExtensionOperationError, ExtensionErrorCodes
 from azurelinuxagent.common.future import ustr
 from azurelinuxagent.common.protocol import get_protocol_util
 from azurelinuxagent.common.protocol.restapi import ExtHandlerStatus, \
@@ -75,6 +75,9 @@ DEFAULT_EXT_TIMEOUT_MINUTES = 90
 
 AGENT_STATUS_FILE = "waagent_status.json"
 
+NUMBER_OF_DOWNLOAD_RETRIES = 5
+
+DEFAULT_CORES_COUNT = -1
 
 def get_traceback(e):
     if sys.version_info[0] == 3:
@@ -138,6 +141,9 @@ def parse_ext_status(ext_status, data):
     formatted_message = status_data.get('formattedMessage')
     ext_status.message = parse_formatted_message(formatted_message)
     substatus_list = status_data.get('substatus', [])
+    # some extensions incorrectly report an empty substatus with a null value
+    if substatus_list is None:
+        substatus_list = []
     for substatus in substatus_list:
         if substatus is not None:
             ext_status.substatusList.append(parse_ext_substatus(substatus))
@@ -450,6 +456,7 @@ class ExtHandlersHandler(object):
         if handler_state == ExtHandlerState.NotInstalled:
             ext_handler_i.set_handler_state(ExtHandlerState.NotInstalled)
             ext_handler_i.download()
+            ext_handler_i.initialize()
             ext_handler_i.update_settings()
             if old_ext_handler_i is None:
                 ext_handler_i.install()
@@ -743,54 +750,85 @@ class ExtHandlerInstance(object):
         add_event(name=self.ext_handler.name, version=ext_handler_version, message=message,
                   op=self.operation, is_success=is_success, duration=duration, log_event=log_event)
 
+    def _download_extension_package(self, source_uri, target_file):
+        self.logger.info("Downloading extension package: {0}", source_uri)
+        try:
+            if not self.protocol.download_ext_handler_pkg(source_uri, target_file):
+                raise Exception("Failed to download extension package - no error information is available")
+        except Exception as exception:
+            self.logger.info("Error downloading extension package: {0}", ustr(exception))
+            if os.path.exists(target_file):
+                os.remove(target_file)
+            return False
+        return True
+
+    def _unzip_extension_package(self, source_file, target_directory):
+        self.logger.info("Unzipping extension package: {0}", source_file)
+        try:
+            zipfile.ZipFile(source_file).extractall(target_directory)
+        except Exception as exception:
+            logger.info("Error while unzipping extension package: {0}", ustr(exception))
+            os.remove(source_file)
+            if os.path.exists(target_directory):
+                shutil.rmtree(target_directory)
+            return False
+        return True
+
     def download(self):
         begin_utc = datetime.datetime.utcnow()
-        self.logger.verbose("Download extension package")
         self.set_operation(WALAEventOperation.Download)
 
-        if self.pkg is None:
+        if self.pkg is None or self.pkg.uris is None or len(self.pkg.uris) == 0:
             raise ExtensionDownloadError("No package uri found")
 
-        uris_shuffled = self.pkg.uris
-        random.shuffle(uris_shuffled)
-        file_downloaded = False
+        destination = os.path.join(conf.get_lib_dir(), os.path.basename(self.pkg.uris[0].uri) + ".zip")
 
-        for uri in uris_shuffled:
-            try:
-                destination = os.path.join(conf.get_lib_dir(), os.path.basename(uri.uri) + ".zip")
+        package_exists = False
+        if os.path.exists(destination):
+            self.logger.info("Using existing extension package: {0}", destination)
+            if self._unzip_extension_package(destination, self.get_base_dir()):
+                package_exists = True
+            else:
+                self.logger.info("The existing extension package is invalid, will ignore it.")
 
-                if os.path.exists(destination):
-                    file_downloaded = True
-                    self.pkg_file = destination
-                    break
-                else:
-                    file_downloaded = self.protocol.download_ext_handler_pkg(uri.uri, destination)
+        if not package_exists:
+            downloaded = False
+            i = 0
+            while i < NUMBER_OF_DOWNLOAD_RETRIES:
+                uris_shuffled = self.pkg.uris
+                random.shuffle(uris_shuffled)
 
-                    if file_downloaded and os.path.exists(destination):
-                        self.pkg_file = destination
+                for uri in uris_shuffled:
+                    if not self._download_extension_package(uri.uri, destination):
+                        continue
+
+                    if self._unzip_extension_package(destination, self.get_base_dir()):
+                        downloaded = True
                         break
 
-            except Exception as e:
-                logger.warn("Error while downloading extension: {0}", ustr(e))
+                if downloaded:
+                    break
 
-        if not file_downloaded:
-            raise ExtensionDownloadError("Failed to download extension", code=1001)
+                self.logger.info("Failed to download the extension package from all uris, will retry after a minute")
+                time.sleep(60)
+                i += 1
 
-        self.logger.verbose("Unzip extension package")
-        try:
-            zipfile.ZipFile(self.pkg_file).extractall(self.get_base_dir())
-        except IOError as e:
-            fileutil.clean_ioerror(e, paths=[self.get_base_dir(), self.pkg_file])
-            raise ExtensionError(u"Failed to unzip extension package", e, code=1001)
+            if not downloaded:
+                raise ExtensionDownloadError("Failed to download extension",
+                                             code=ExtensionErrorCodes.PluginManifestDownloadError)
+
+        self.pkg_file = destination
+
+        duration = elapsed_milliseconds(begin_utc)
+        self.report_event(message="Download succeeded", duration=duration)
+
+    def initialize(self):
+        self.logger.info("Initialize extension directory")
 
         # Add user execute permission to all files under the base dir
         for file in fileutil.get_all_files(self.get_base_dir()):
             fileutil.chmod(file, os.stat(file).st_mode | stat.S_IXUSR)
 
-        duration = elapsed_milliseconds(begin_utc)
-        self.report_event(message="Download succeeded", duration=duration)
-
-        self.logger.info("Initialize extension directory")
         # Save HandlerManifest.json
         man_file = fileutil.search_file(self.get_base_dir(), 'HandlerManifest.json')
 
@@ -837,6 +875,7 @@ class ExtHandlerInstance(object):
     def enable(self):
         self.set_operation(WALAEventOperation.Enable)
         man = self.load_manifest()
+<<<<<<< HEAD
         try:
             resource_man = self.load_resource_manifest()
         except ExtensionError as e:
@@ -845,44 +884,73 @@ class ExtHandlerInstance(object):
         enable_cmd = man.get_enable_command()
         self.logger.info("Enable extension [{0}]".format(enable_cmd))
         self.launch_command(enable_cmd, timeout=300, extension_error_code=1009, resource_limits=resource_man)
+=======
+        handler_configuration = self.load_handler_configuration() #azurelinuxagent.ga.exthandlers.ExtHandlerInstance#load_handler_configuration
+
+        enable_cmd = man.get_enable_command()
+        self.logger.info("Enable extension [{0}]".format(enable_cmd))
+        self.launch_command(enable_cmd, timeout=300,
+                            extension_error_code=ExtensionErrorCodes.PluginEnableProcessingFailed,
+                            handler_configuration=handler_configuration)
+>>>>>>> vameru-cgroup-limits-through-manifest
         self.set_handler_state(ExtHandlerState.Enabled)
         self.set_handler_status(status="Ready", message="Plugin enabled")
 
     def disable(self):
         self.set_operation(WALAEventOperation.Disable)
         man = self.load_manifest()
+<<<<<<< HEAD
         try:
             resource_man = self.load_resource_manifest()
         except ExtensionError as e:
             self.logger.verbose('Failed to load resource manifest file: {0}'.format(e.message))
+=======
+        handler_configuration = self.load_handler_configuration()
+>>>>>>> vameru-cgroup-limits-through-manifest
 
         disable_cmd = man.get_disable_command()
         self.logger.info("Disable extension [{0}]".format(disable_cmd))
         self.launch_command(disable_cmd, timeout=900,
+<<<<<<< HEAD
                             extension_error_code=1010,
                             resource_limits=resource_man)
+=======
+                            extension_error_code=ExtensionErrorCodes.PluginDisableProcessingFailed,
+                            handler_configuration=handler_configuration)
+>>>>>>> vameru-cgroup-limits-through-manifest
         self.set_handler_state(ExtHandlerState.Installed)
         self.set_handler_status(status="NotReady", message="Plugin disabled")
 
     def install(self):
+        self.set_operation(WALAEventOperation.Install)
         man = self.load_manifest()
+<<<<<<< HEAD
         try:
             resource_man = self.load_resource_manifest()
         except ExtensionError as e:
             self.logger.verbose('Failed to load resource manifest file: {0}'.format(e.message))
+=======
+        handler_configuration = self.load_handler_configuration()
+>>>>>>> vameru-cgroup-limits-through-manifest
 
         install_cmd = man.get_install_command()
         self.logger.info("Install extension [{0}]".format(install_cmd))
         self.set_operation(WALAEventOperation.Install)
         self.launch_command(install_cmd, timeout=900,
+<<<<<<< HEAD
                             extension_error_code=1007,
                             resource_limits=resource_man)
+=======
+                            extension_error_code=ExtensionErrorCodes.PluginInstallProcessingFailed,
+                            handler_configuration=handler_configuration)
+>>>>>>> vameru-cgroup-limits-through-manifest
         self.set_handler_state(ExtHandlerState.Installed)
 
     def uninstall(self):
         try:
             self.set_operation(WALAEventOperation.UnInstall)
             man = self.load_manifest()
+<<<<<<< HEAD
             try:
                 resource_man = self.load_resource_manifest()
             except ExtensionError as e:
@@ -891,6 +959,13 @@ class ExtHandlerInstance(object):
             uninstall_cmd = man.get_uninstall_command()
             self.logger.info("Uninstall extension [{0}]".format(uninstall_cmd))
             self.launch_command(uninstall_cmd, resource_limits=resource_man)
+=======
+            handler_configuration = self.load_handler_configuration()
+            uninstall_cmd = man.get_uninstall_command()
+            self.logger.info("Uninstall extension [{0}]".format(uninstall_cmd))
+            self.launch_command(uninstall_cmd,
+                                handler_configuration=handler_configuration)
+>>>>>>> vameru-cgroup-limits-through-manifest
         except ExtensionError as e:
             self.report_event(message=ustr(e), is_success=False)
 
@@ -901,10 +976,14 @@ class ExtHandlerInstance(object):
         try:
             self.set_operation(WALAEventOperation.Update)
             man = self.load_manifest()
+<<<<<<< HEAD
             try:
                 resource_man = self.load_resource_manifest()
             except ExtensionError as e:
                 self.logger.verbose('Failed to load resource manifest file: {0}'.format(e.message))
+=======
+            handler_configuration = self.load_handler_configuration()
+>>>>>>> vameru-cgroup-limits-through-manifest
 
             update_cmd = man.get_update_command()
             self.logger.info("Update extension [{0}]".format(update_cmd))
@@ -912,7 +991,11 @@ class ExtHandlerInstance(object):
                                 timeout=900,
                                 extension_error_code=1008,
                                 env={'VERSION': version},
+<<<<<<< HEAD
                                 resource_limits=resource_man)
+=======
+                                handler_configuration=handler_configuration)
+>>>>>>> vameru-cgroup-limits-through-manifest
         except ExtensionError:
             # prevent the handler update from being retried
             self.set_handler_state(ExtHandlerState.Failed)
@@ -1008,7 +1091,7 @@ class ExtHandlerInstance(object):
             ext_status.status = "error"
         except ExtensionError as e:
             ext_status.message = u"Malformed status file {0}".format(e)
-            ext_status.code = e.code
+            ext_status.code = ExtensionErrorCodes.PluginSettingsStatusInvalid
             ext_status.status = "error"
         except ValueError as e:
             ext_status.message = u"Malformed status file {0}".format(e)
@@ -1096,7 +1179,12 @@ class ExtHandlerInstance(object):
         last_update = int(time.time() - os.stat(heartbeat_file).st_mtime)
         return last_update <= 600
 
+<<<<<<< HEAD
     def launch_command(self, cmd, timeout=300, extension_error_code=1000, env=None, resource_limits=None):
+=======
+    def launch_command(self, cmd, timeout=300, extension_error_code=ExtensionErrorCodes.PluginProcessingError, env=None,
+                       handler_configuration=None):
+>>>>>>> vameru-cgroup-limits-through-manifest
         begin_utc = datetime.datetime.utcnow()
         self.logger.verbose("Launch command: [{0}]", cmd)
 
@@ -1119,7 +1207,7 @@ class ExtHandlerInstance(object):
                         the fork() and the exec() of sub-process creation.
                         """
                         os.setsid()
-                        CGroups.add_to_extension_cgroup(self.ext_handler.name)
+                        CGroups.add_to_extension_cgroup(self.ext_handler.name, os.getpid())
 
                     process = subprocess.Popen(full_path,
                                                shell=True,
@@ -1132,9 +1220,20 @@ class ExtHandlerInstance(object):
                     raise ExtensionOperationError("Failed to launch '{0}': {1}".format(full_path, e.strerror),
                                                   code=extension_error_code)
 
+<<<<<<< HEAD
                 cg = CGroups.for_extension(self.ext_handler.name, resource_limits)
                 CGroupsTelemetry.track_extension(self.ext_handler.name, cg)
                 msg = ExtHandlerInstance._capture_process_output(process, stdout, stderr, cmd, timeout, extension_error_code)
+=======
+                try:
+                    cg = CGroups.for_extension(self.ext_handler.name, handler_configuration)
+                    CGroupsTelemetry.track_extension(self.ext_handler.name, cg, handler_configuration)
+                except Exception as e:
+                    self.logger.warn("Unable to setup cgroup {0}: {1}".format(self.ext_handler.name, e))
+
+                msg = ExtHandlerInstance._capture_process_output(process, stdout, stderr, cmd, timeout,
+                                                                 extension_error_code)
+>>>>>>> vameru-cgroup-limits-through-manifest
 
                 duration = elapsed_milliseconds(begin_utc)
                 log_msg = "{0}\n{1}".format(cmd, "\n".join([line for line in msg.split('\n') if line != ""]))
@@ -1144,7 +1243,8 @@ class ExtHandlerInstance(object):
                 return msg
 
     @staticmethod
-    def _capture_process_output(process, stdout_file, stderr_file, cmd, timeout, code=-1):
+    def _capture_process_output(process, stdout_file, stderr_file, cmd, timeout,
+                                code=ExtensionErrorCodes.PluginUnknownFailure):
         retry = timeout
         while retry > 0 and process.poll() is None:
             time.sleep(1)
@@ -1165,7 +1265,8 @@ class ExtHandlerInstance(object):
         # timeout expired
         if retry == 0:
             os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            raise ExtensionError("Timeout({0}): {1}\n{2}".format(timeout, cmd, read_output()), code=code)
+            raise ExtensionError("Timeout({0}): {1}\n{2}".format(timeout, cmd, read_output()),
+                                 code=ExtensionErrorCodes.PluginHandlerScriptTimedout)
 
         # process completed or forked; sleep 1 sec to give the child process (if any) a chance to start
         time.sleep(1)
@@ -1176,6 +1277,7 @@ class ExtHandlerInstance(object):
 
         return read_output()
 
+<<<<<<< HEAD
     def load_resource_manifest(self):
         man_file = self.get_resource_manifest_file()
         try:
@@ -1186,15 +1288,36 @@ class ExtHandlerInstance(object):
             raise ExtensionError('Malformed resource manifest file ({0}).'.format(man_file))
 
         return ResourceManifest(data)
+=======
+    def load_handler_configuration(self):
+        handler_config = None
+        data = None
+        config_file = self.get_handler_configuration_file()
+        try:
+            data = json.loads(fileutil.read_file(config_file))
+        except (IOError, OSError) as e:
+            self.logger.warn('Failed to load resource manifest file ({0}): {1}'.format(config_file, e.strerror))
+        except ValueError:
+            self.logger.warn('Malformed resource manifest file ({0}).'.format(config_file))
+
+        try:
+            handler_config = HandlerConfiguration(data)
+        except ExtensionError as e:
+            self.logger.warn('Failed to load resource manifest file: {0}'.format(ustr(e)))
+
+        return handler_config
+>>>>>>> vameru-cgroup-limits-through-manifest
 
     def load_manifest(self):
         man_file = self.get_manifest_file()
         try:
             data = json.loads(fileutil.read_file(man_file))
         except (IOError, OSError) as e:
-            raise ExtensionError('Failed to load manifest file ({0}): {1}'.format(man_file, e.strerror), code=1002)
+            raise ExtensionError('Failed to load manifest file ({0}): {1}'.format(man_file, e.strerror),
+                                 code=ExtensionErrorCodes.PluginHandlerManifestNotFound)
         except ValueError:
-            raise ExtensionError('Malformed manifest file ({0}).'.format(man_file), code=1003)
+            raise ExtensionError('Malformed manifest file ({0}).'.format(man_file),
+                                 code=ExtensionErrorCodes.PluginHandlerManifestDeserializationError)
 
         return HandlerManifest(data[0])
 
@@ -1328,8 +1451,13 @@ class ExtHandlerInstance(object):
     def get_manifest_file(self):
         return os.path.join(self.get_base_dir(), 'HandlerManifest.json')
 
+<<<<<<< HEAD
     def get_resource_manifest_file(self):
         return os.path.join(self.get_base_dir(), 'ResourceManifest.json')
+=======
+    def get_handler_configuration_file(self):
+        return os.path.join(self.get_base_dir(), 'HandlerConfiguration.json')
+>>>>>>> vameru-cgroup-limits-through-manifest
 
     def get_env_file(self):
         return os.path.join(self.get_base_dir(), 'HandlerEnvironment.json')
@@ -1395,6 +1523,7 @@ class HandlerManifest(object):
             return True
         return update_mode.lower() == "updatewithinstall"
 
+<<<<<<< HEAD
     def get_resource_requirements(self):
         return self.data['resourceRequirements'] if self.contains_resource_limits else None
 
@@ -1411,6 +1540,18 @@ class ResourceManifest(object):
     def __init__(self, data):
         if data is None or data['resourceRequirements'] is None:
             raise ExtensionError('Malformed resource manifest file.')
+=======
+
+class HandlerConfiguration(object):
+    def __init__(self, data):
+        if data is None:
+            raise ExtensionError('Malformed handler configuration file.')
+        if "handlerConfiguration" not in data:
+            raise ExtensionError('Malformed handler configuration file.')
+        if "linux" not in data['handlerConfiguration']:
+            raise ExtensionError('No linux configurations present in HandlerConfiguration')
+
+>>>>>>> vameru-cgroup-limits-through-manifest
         self.data = data
 
     def get_name(self):
@@ -1419,6 +1560,7 @@ class ResourceManifest(object):
     def get_version(self):
         return self.data["version"]
 
+<<<<<<< HEAD
     def get_cpu_limits(self):
         cpu_limits = []
         if "cpu" in self.data['resourceRequirements']:
@@ -1440,3 +1582,90 @@ class ResourceLimits(object):
     def __init__(self, data):
         self.size = data["size"]
         self.limits = data["limits"]
+=======
+    def get_linux_configurations(self):
+        return self.data['handlerConfiguration']['linux']
+
+    def get_resource_configurations(self):
+        if "resources" in self.get_linux_configurations() and \
+                "cpu" in self.get_linux_configurations()["resources"] or \
+                "memory" in self.get_linux_configurations()["resources"]:
+            return self.get_linux_configurations()["resources"]
+        return None
+
+    def get_cpu_limits_for_extension(self):
+        resource_config = self.get_resource_configurations()
+
+        if resource_config and "cpu" in resource_config:
+            cpu_limits_object = CpuLimits(resource_config["cpu"])
+            return cpu_limits_object
+        else:
+            return None
+
+    def get_memory_limits_for_extension(self):
+        resource_config = self.get_resource_configurations()
+
+        if resource_config and "memory" in resource_config:
+            return MemoryLimit(resource_config["memory"])
+        else:
+            return None
+
+
+class CpuLimits(object):
+    def __init__(self, cpu_node):
+        self.cpu_limits = []
+        self.cores = []
+
+        for i in cpu_node:
+            if "cores" not in i or "limit_percentage" not in i:
+                raise ExtensionError("Malformed CPU limit node in HandlerConfiguration")
+            self.cpu_limits.append(CpuLimit(i["cores"], i["limit_percentage"]))
+            self.cores.append(i["cores"])
+
+        if DEFAULT_CORES_COUNT not in self.cores:
+            raise ExtensionError("Default CPU limit not set."
+                                 " Core configuration for {0} not present".format(DEFAULT_CORES_COUNT))
+
+        self.cpu_limits = sorted(self.cpu_limits)
+
+    def __str__(self):
+        return self.cpu_limits.__str__()
+
+
+class CpuLimit(object):
+    def __init__(self, cores, limit_percentage):
+        self.cores = cores
+        self.limit_percentage = limit_percentage
+
+    def __eq__(self, other):
+        return self.cores == other.cores
+
+    def __lt__(self, other):
+        return self.cores < other.cores
+
+    def __gt__(self, other):
+        return self.cores > other.cores
+
+    def __str__(self):
+        return {"cores": self.cores, "limit_percentage": self.limit_percentage}.__str__()
+
+    def __repr__(self):
+        return {"cores": self.cores, "limit_percentage": self.limit_percentage}.__str__()
+
+
+class MemoryLimit(object):
+    def __init__(self, memory_node):
+        set_for_memory_oom_kill = ["enabled", "disabled"]
+
+        self.max_limit_percentage = memory_node[
+            "max_limit_percentage"] if "max_limit_percentage" in memory_node else None
+        self.max_limit_MBs = memory_node["max_limit_MBs"] if "max_limit_MBs" in memory_node else None
+        self.memory_pressure_warning = memory_node["memory_pressure_warning"] if "memory_pressure_warning" in memory_node else None
+
+        self.memory_oom_kill = "disabled"  # default
+        if "memory_oom_kill" in memory_node:
+            if memory_node["memory_oom_kill"].lower() in set_for_memory_oom_kill:
+                self.memory_oom_kill = memory_node["memory_oom_kill"].lower()
+            else:
+                raise ExtensionError("Malformed memory_oom_kill flag in HandlerConfiguration")
+>>>>>>> vameru-cgroup-limits-through-manifest

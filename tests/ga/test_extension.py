@@ -17,13 +17,10 @@
 
 import os.path
 
-from nose.tools import assert_equal
-
-from tests.protocol.mockwiredata import *
-
 from azurelinuxagent.common.protocol.restapi import Extension
+from azurelinuxagent.common.protocol.wire import WireProtocol, InVMArtifactsProfile
 from azurelinuxagent.ga.exthandlers import *
-from azurelinuxagent.common.protocol.wire import WireProtocol
+from tests.protocol.mockwiredata import *
 
 
 def do_not_run_test():
@@ -407,7 +404,11 @@ class TestExtension(ExtensionTestCase):
         exthandlers_handler.run()
         self._assert_handler_status(protocol.report_vm_status, "Ready", 1, "1.0.0")
 
+<<<<<<< HEAD
     def test_ext_handler_with_cgroup_limits_in_manifest(self, *args):
+=======
+    def test_ext_handler_with_resource_limits_passed_in_hanlder_configuration(self, *args):
+>>>>>>> vameru-cgroup-limits-through-manifest
         test_data = WireProtocolData(DATA_FILE_CGROUP_LIMITS_SET)
         exthandlers_handler, protocol = self._create_mock(test_data, *args)
 
@@ -575,6 +576,329 @@ class TestExtension(ExtensionTestCase):
         actual_status_json = json.loads(fileutil.read_file(status_path))
 
         self.assertEquals(expected_status_json, actual_status_json)
+
+    def test_handler_configuration_complete_configuration(self, *args):
+        data = '''{
+  "name": "ExampleHandlerLinux",
+  "version": 1.0,
+  "handlerConfiguration": {
+    "linux": {
+      "resources": {
+        "cpu": [
+          {
+            "cores": 2,
+            "limit_percentage": 25
+          },
+          {
+            "cores": 8,
+            "limit_percentage": 20
+          },
+          {
+            "cores": -1,
+            "limit_percentage": 15
+          }
+        ],
+        "memory": {
+          "max_limit_percentage": 20,
+          "max_limit_MBs": 1000,
+          "memory_pressure_warning": "low",
+          "memory_oom_kill": "enabled"
+        }
+      }
+    },
+    "windows": {}
+  }
+}
+'''
+        handlerConfig = HandlerConfiguration(json.loads(data))
+
+        self.assertEqual(handlerConfig.get_name(), "ExampleHandlerLinux")
+        self.assertEqual(handlerConfig.get_version(), 1.0)
+
+        cpu_limits = handlerConfig.get_cpu_limits_for_extension().cpu_limits
+        self.assertEquals(3, len(cpu_limits))  # 3 configurations sent
+
+        memory_limits = handlerConfig.get_memory_limits_for_extension()
+        self.assertEqual(memory_limits.max_limit_percentage, 20)
+        self.assertEqual(memory_limits.max_limit_MBs, 1000)
+        self.assertEqual(memory_limits.memory_pressure_warning, "low")
+        self.assertEqual(memory_limits.memory_oom_kill, "enabled")
+
+    def test_handler_configuration_only_cpu_configuration(self, *args):
+        data = '''{
+      "name": "ExampleHandlerLinux",
+      "version": 1.0,
+      "handlerConfiguration": {
+        "linux": {
+          "resources": {
+            "cpu": [
+              {
+                "cores": 2,
+                "limit_percentage": 25
+              },
+              {
+                "cores": 8,
+                "limit_percentage": 20
+              },
+              {
+                "cores": -1,
+                "limit_percentage": 15
+              }
+            ]
+          }
+        }
+      }
+    }
+'''
+        handler_config = HandlerConfiguration(json.loads(data))
+        self.assertIsNone(handler_config.get_memory_limits_for_extension())
+
+        cpu_limits = handler_config.get_cpu_limits_for_extension().cpu_limits
+        print(cpu_limits)
+        self.assertEquals(3, len(cpu_limits))  # 3 configurations sent
+
+        data = '''{
+              "name": "ExampleHandlerLinux",
+              "version": 1.0,
+              "handlerConfiguration": {
+                "linux": {
+                  "resources": {
+                    "cpu": [
+                      {
+                        "cores": -1,
+                        "limit_percentage": 15
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+        '''
+        handler_config = HandlerConfiguration(json.loads(data))
+        self.assertIsNone(handler_config.get_memory_limits_for_extension())
+
+        cpu_limits = handler_config.get_cpu_limits_for_extension().cpu_limits
+        self.assertEquals(1, len(cpu_limits))  # 3 configurations sent
+        self.assertEquals(-1, cpu_limits[0].cores)
+        self.assertEquals(15, cpu_limits[0].limit_percentage)
+
+    def test_handler_configuration_incorrect_cpu_configuration(self, *args):
+        data = '''{
+      "name": "ExampleHandlerLinux",
+      "version": 1.0,
+      "handlerConfiguration": {
+        "linux": {
+          "resources": {
+            "cpu": [
+              {
+                "cores": 2,
+                "limit_percentage": 25
+              },
+              {
+                "cores": 8,
+                "limit_percentage": 20
+              }
+            ]
+          }
+        }
+      }
+    }
+'''
+        handler_config = HandlerConfiguration(json.loads(data))
+        try:
+            handler_config.get_cpu_limits_for_extension().cpu_limits
+        except ExtensionError as e:
+            self.assertEqual(type(e), ExtensionError)
+
+        data = '''{
+                  "name": "ExampleHandlerLinux",
+                  "version": 1.0,
+                  "handlerConfiguration": {
+                    "linux": {
+                      "resources": {
+                        "cpu": [
+                          {
+                            "cores": 2,
+                            "limit_percentage": 25
+                          },
+                          {
+                            "cores": 8
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+            '''
+        handler_config = HandlerConfiguration(json.loads(data))
+        try:
+            handler_config.get_cpu_limits_for_extension().cpu_limits
+        except ExtensionError as e:
+            self.assertEqual(type(e), ExtensionError)
+
+    def test_handler_configuration_only_memory_configuration(self, *args):
+        data = '''{
+      "name": "ExampleHandlerLinux",
+      "version": 1.0,
+      "handlerConfiguration": {
+        "linux": {
+          "resources": {
+            "memory": {
+              "max_limit_percentage": 20,
+              "max_limit_MBs": 1000,
+              "memory_pressure_warning": "low",
+              "memory_oom_kill": "enabled"
+            }
+          }
+        }
+      }
+    }
+    '''
+        handler_config = HandlerConfiguration(json.loads(data))
+        self.assertIsNone(handler_config.get_cpu_limits_for_extension())
+
+        memory_limits = handler_config.get_memory_limits_for_extension()
+        self.assertEqual(memory_limits.max_limit_percentage, 20)
+        self.assertEqual(memory_limits.max_limit_MBs, 1000)
+        self.assertEqual(memory_limits.memory_pressure_warning, "low")
+        self.assertEqual(memory_limits.memory_oom_kill, "enabled")
+
+        data = '''{
+              "name": "ExampleHandlerLinux",
+              "version": 1.0,
+              "handlerConfiguration": {
+                "linux": {
+                  "resources": {
+                    "memory": {
+                      "max_limit_percentage": 20,
+                      "max_limit_MBs": 1000,
+                      "memory_pressure_warning": "low"
+                    }
+                  }
+                }
+              }
+            }
+            '''
+        handler_config = HandlerConfiguration(json.loads(data))
+        memory_limits = handler_config.get_memory_limits_for_extension()
+        self.assertEqual(memory_limits.max_limit_percentage, 20)
+        self.assertEqual(memory_limits.max_limit_MBs, 1000)
+        self.assertEqual(memory_limits.memory_pressure_warning, "low")
+        self.assertEqual(memory_limits.memory_oom_kill, "disabled")
+
+        data = '''{
+                      "name": "ExampleHandlerLinux",
+                      "version": 1.0,
+                      "handlerConfiguration": {
+                        "linux": {
+                          "resources": {
+                            "memory": {
+                              "max_limit_percentage": 20,
+                              "max_limit_MBs": 1000
+                            }
+                          }
+                        }
+                      }
+                    }
+                    '''
+        handler_config = HandlerConfiguration(json.loads(data))
+        memory_limits = handler_config.get_memory_limits_for_extension()
+        self.assertEqual(memory_limits.max_limit_percentage, 20)
+        self.assertEqual(memory_limits.max_limit_MBs, 1000)
+        self.assertIsNone(memory_limits.memory_pressure_warning)
+        self.assertEqual(memory_limits.memory_oom_kill, "disabled")
+
+    def test_handler_configuration_incorrect_memory_configuration(self, *args):
+        data = '''{
+      "name": "ExampleHandlerLinux",
+      "version": 1.0,
+      "handlerConfiguration": {
+        "linux": {
+          "resources": {
+            "memory": {
+              "max_limit_percentage": 20,
+              "max_limit_MBs": 1000,
+              "memory_pressure_warning": "low",
+              "memory_oom_kill": "enabledd"
+            }
+          }
+        }
+      }
+    }
+    '''
+        handlerConfig = HandlerConfiguration(json.loads(data))
+        self.assertIsNone(handlerConfig.get_cpu_limits_for_extension())
+
+        try:
+            handlerConfig.get_memory_limits_for_extension()
+        except Exception as e:
+            self.assertEqual(type(e), ExtensionError)
+            self.assertEqual(e.__str__(), "Malformed memory_oom_kill flag in HandlerConfiguration")
+
+    def test_handler_configuration_incorrect_configuration(self, *args):
+        data = '''{
+      "name": "ExampleHandlerLinux",
+      "version": 1.0,
+      "handlerConfiguration": {
+        "linux": {
+          "resources": {
+          }
+        }
+      }
+    }
+    '''
+        handler_resource_reqs = HandlerConfiguration(json.loads(data)).get_resource_configurations()
+        self.assertIsNone(handler_resource_reqs)
+
+        data = '''{
+              "name": "ExampleHandlerLinux",
+              "version": 1.0,
+              "handlerConfiguration": {}
+            }
+            '''
+        try:
+            HandlerConfiguration(json.loads(data))
+        except Exception as e:
+            self.assertEqual(type(e), ExtensionError)
+
+        data = '''{
+"name": "ExampleHandlerLinux",
+"version": 1.0
+}
+'''
+        try:
+            HandlerConfiguration(json.loads(data))
+        except Exception as e:
+            self.assertEqual(type(e), ExtensionError)
+
+    def test_load_handler_configuration(self, *args):
+        handler_name = "Not.A.Real.Extension"
+        handler_version = "1.2.3"
+
+        ext_handler = ExtHandler(handler_name)
+        ext_handler.properties.version = handler_version
+        ext_handler_i = ExtHandlerInstance(ext_handler, "dummy protocol")
+
+        with patch(
+                "azurelinuxagent.ga.exthandlers.ExtHandlerInstance.get_handler_configuration_file") as \
+                patch_get_handler_configuration_file:
+            patch_get_handler_configuration_file.return_value = load_data_path("ext/SampleHandlerConfiguration.json")
+            handler_config = ext_handler_i.load_handler_configuration()
+            self.assertIsNotNone(handler_config)
+
+        with patch(
+                "azurelinuxagent.ga.exthandlers.ExtHandlerInstance.get_handler_configuration_file") as \
+                patch_get_handler_configuration_file:
+            patch_get_handler_configuration_file.return_value = load_data_path("ext/NotPresent.json")
+            handler_config = ext_handler_i.load_handler_configuration()
+            self.assertIsNone(handler_config)
+
+        with patch(
+                "azurelinuxagent.ga.exthandlers.ExtHandlerInstance.get_handler_configuration_file") as \
+                patch_get_handler_configuration_file:
+            patch_get_handler_configuration_file.return_value = load_data_path("ext/SampleMalformedHandlerConfiguration.json")
+            handler_config = ext_handler_i.load_handler_configuration()
+            self.assertIsNone(handler_config)
 
     def test_ext_handler_rollingupgrade(self, *args):
         test_data = WireProtocolData(DATA_FILE_EXT_ROLLINGUPGRADE)
@@ -1442,8 +1766,13 @@ class TestExtensionWithCGroupsEnabled(AgentTestCase):
         handler.protocol_util.get_protocol = Mock(return_value=protocol)
         return handler, protocol
 
+<<<<<<< HEAD
     @patch("azurelinuxagent.common.cgroups.CGroups.add")
     def test_ext_handler_with_cgroup_limits_in_manifest(self, mock_add_pid, *args):
+=======
+    @patch("azurelinuxagent.common.cgroups.cgroups.CGroups.add")
+    def test_ext_handler_with_cgroup_limits_passed(self, mock_add_pid, *args):
+>>>>>>> vameru-cgroup-limits-through-manifest
         test_data = WireProtocolData(DATA_FILE_CGROUP_LIMITS_SET)
         exthandlers_handler, protocol = self._create_mock(test_data, *args)
 
@@ -1630,6 +1959,31 @@ class TestExtensionSequencing(AgentTestCase):
 
         extensions_to_be_failed = ["G"]
         self._run_test(extensions_to_be_failed, expected_sequence, exthandlers_handler)
+
+
+class TestInVMArtifactsProfile(AgentTestCase):
+    def test_it_should_parse_boolean_values(self):
+        profile_json = '{ "onHold": true }'
+        profile = InVMArtifactsProfile(profile_json)
+        self.assertTrue(profile.is_on_hold(), "Failed to parse '{0}'".format(profile_json))
+
+        profile_json = '{ "onHold": false }'
+        profile = InVMArtifactsProfile(profile_json)
+        self.assertFalse(profile.is_on_hold(), "Failed to parse '{0}'".format(profile_json))
+
+    def test_it_should_parse_boolean_values_encoded_as_strings(self):
+        profile_json = '{ "onHold": "true" }'
+        profile = InVMArtifactsProfile(profile_json)
+        self.assertTrue(profile.is_on_hold(), "Failed to parse '{0}'".format(profile_json))
+
+        profile_json = '{ "onHold": "false" }'
+        profile = InVMArtifactsProfile(profile_json)
+        self.assertFalse(profile.is_on_hold(), "Failed to parse '{0}'".format(profile_json))
+
+        profile_json = '{ "onHold": "TRUE" }'
+        profile = InVMArtifactsProfile(profile_json)
+        self.assertTrue(profile.is_on_hold(), "Failed to parse '{0}'".format(profile_json))
+
 
 
 if __name__ == '__main__':

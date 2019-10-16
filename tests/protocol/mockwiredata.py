@@ -67,9 +67,20 @@ DATA_FILE_EXT_SINGLE["manifest"] = "wire/manifest_deletion.xml"
 DATA_FILE_MULTIPLE_EXT = DATA_FILE.copy()
 DATA_FILE_MULTIPLE_EXT["ext_conf"] = "wire/ext_conf_multiple_extensions.xml"
 
+<<<<<<< HEAD
 DATA_FILE_CGROUP_LIMITS_SET = DATA_FILE.copy()
 DATA_FILE_CGROUP_LIMITS_SET["test_ext"] = "ext/sample_ext_with_limits-1.4.0.zip"
 
+=======
+DATA_FILE_NO_CERT_FORMAT = DATA_FILE.copy()
+DATA_FILE_NO_CERT_FORMAT["certs"] = "wire/certs_no_format_specified.xml"
+
+DATA_FILE_CERT_FORMAT_NOT_PFX = DATA_FILE.copy()
+DATA_FILE_CERT_FORMAT_NOT_PFX["certs"] = "wire/certs_format_not_pfx.xml"
+
+DATA_FILE_CGROUP_LIMITS_SET = DATA_FILE.copy()
+DATA_FILE_CGROUP_LIMITS_SET["test_ext"] = "ext/sample_ext_with_limits-1.4.0.zip"
+>>>>>>> vameru-cgroup-limits-through-manifest
 
 class WireProtocolData(object):
     def __init__(self, data_files=DATA_FILE):

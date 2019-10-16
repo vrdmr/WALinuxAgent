@@ -1178,7 +1178,6 @@ class WireClient(object):
         return {
             "x-ms-agent-name": "WALinuxAgent",
             "x-ms-version": PROTOCOL_VERSION,
-            "x-ms-cipher-name": "DES_EDE3_CBC",
             "x-ms-guest-agent-public-x509-cert": cert
         }
 
@@ -1453,6 +1452,12 @@ class Certificates(object):
         data = findtext(xml_doc, "Data")
         if data is None:
             return
+    
+        # if the certificates format is not Pkcs7BlobWithPfxContents do not parse it
+        certificateFormat = findtext(xml_doc, "Format")
+        if certificateFormat and certificateFormat != "Pkcs7BlobWithPfxContents":
+            logger.warn("The Format is not Pkcs7BlobWithPfxContents. Format is " + certificateFormat)
+            return
 
         cryptutil = CryptUtil(conf.get_openssl_cmd())
         p7m_file = os.path.join(conf.get_lib_dir(), P7M_FILE_NAME)
@@ -1713,5 +1718,5 @@ class InVMArtifactsProfile(object):
     def is_on_hold(self):
         # hasattr() is not available in Python 2.6
         if 'onHold' in self.__dict__:
-            return self.onHold.lower() == 'true'
+            return str(self.onHold).lower() == 'true'
         return False
